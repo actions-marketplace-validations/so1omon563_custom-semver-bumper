@@ -59,6 +59,53 @@ teardown() {
     grep -q "bump_type=patch" "$GITHUB_OUTPUT_FILE"
 }
 
+# ── Configuration validation ─────────────────────────────────────────────────
+
+@test "script: invalid DEFAULT_BUMP fails before creating a tag" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" DEFAULT_BUMP="banana" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid DEFAULT_BUMP 'banana'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: invalid MARKER_STYLE fails before creating a tag" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" MARKER_STYLE="banana" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid MARKER_STYLE 'banana'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: invalid CC_TYPE_MAP level fails before creating a tag" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" CC_TYPE_MAP="feat=banana" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid CC_TYPE_MAP entry 'feat=banana'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: invalid BRANCH_PREFIX_MAP level fails before creating a tag" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" BRANCH_PREFIX_MAP="feat=banana" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid BRANCH_PREFIX_MAP entry 'feat=banana'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: malformed map entry fails before creating a tag" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" CC_TYPE_MAP="feat" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid CC_TYPE_MAP entry 'feat': expected key=level"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
 # ── Hashtag markers ───────────────────────────────────────────────────────────
 
 @test "script: default patch bump (no marker)" {
@@ -320,6 +367,40 @@ EOF
     grep -q "bump_type=major" "$GITHUB_OUTPUT_FILE"
 }
 
+@test "script: conventional commit type in body does not control bump" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "Docs" >> README.md
+    git add README.md
+    git commit --quiet -m "Update guide" -m "feat: add dashboard"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" \
+        MARKER_STYLE="conventional-commits" \
+        CC_TYPE_MAP="feat=minor
+fix=patch" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.2.4"
+    grep -q "bump_type=patch" "$GITHUB_OUTPUT_FILE"
+}
+
+@test "script: Conventional Commit breaking-change footer still triggers major" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "API" >> README.md
+    git add README.md
+    git commit --quiet -m "feat: update API" -m "BREAKING CHANGE: remove legacy endpoint"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" \
+        MARKER_STYLE="conventional-commits" \
+        CC_TYPE_MAP="feat=minor
+fix=patch" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v2.0.0"
+    grep -q "bump_type=major" "$GITHUB_OUTPUT_FILE"
+}
+
 @test "script: conventional title takes priority over body markers" {
     git tag -a "v1.0.0" -m "Version 1.0.0"
     git push origin "v1.0.0" --quiet
@@ -348,6 +429,104 @@ EOF
 }
 
 # ── Pre-release ───────────────────────────────────────────────────────────────
+
+@test "script: hyphenated hashtag pre-release suffix is preserved" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "Channel build" >> README.md
+    git add README.md
+    git commit --quiet -m "Build channel #prerelease:team-blue"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" ALLOWED_PRERELEASE_SUFFIXES="team-blue" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.2.4-team-blue.1"
+}
+
+@test "script: hyphenated pre-release footer suffix is preserved" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "Channel build" >> README.md
+    git add README.md
+    git commit --quiet -m "Build channel" -m "Pre-release: team-blue"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" ALLOWED_PRERELEASE_SUFFIXES="team-blue" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.2.4-team-blue.1"
+}
+
+@test "script: hyphenated Conventional Commit scope suffix is preserved" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "Channel build" >> README.md
+    git add README.md
+    git commit --quiet -m "feat(pre:team-blue): add channel build"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" \
+        MARKER_STYLE="conventional-commits" \
+        CC_TYPE_MAP="feat=minor" \
+        ALLOWED_PRERELEASE_SUFFIXES="team-blue" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.3.0-team-blue.1"
+}
+
+@test "script: invalid trailing suffix content is not partially applied" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    echo "Channel build" >> README.md
+    git add README.md
+    git commit --quiet -m "Build channel #prerelease:team-blue_invalid"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" ALLOWED_PRERELEASE_SUFFIXES="team-blue" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.2.4"
+    [ -z "$(git tag -l 'v1.2.4-team-blue.*')" ]
+}
+
+@test "script: hyphenated workflow pre-release suffix creates a valid tag" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+
+    echo "Team build" >> README.md
+    git add README.md
+    git commit --quiet -m "Build for the blue team"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" PRERELEASE_SUFFIX="team-blue" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -eq 0 ]
+    git tag -l | grep -qx "v1.2.4-team-blue.1"
+    grep -q "new_version=v1.2.4-team-blue.1" "$GITHUB_OUTPUT_FILE"
+}
+
+@test "script: workflow pre-release suffix rejects underscores before tag creation" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" PRERELEASE_SUFFIX="alpha_beta" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid PRERELEASE_SUFFIX 'alpha_beta'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: workflow pre-release suffix rejects empty identifier segments" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" PRERELEASE_SUFFIX="alpha..beta" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid PRERELEASE_SUFFIX 'alpha..beta'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
+
+@test "script: workflow pre-release suffix rejects numeric leading zeroes" {
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" PRERELEASE_SUFFIX="alpha.01" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid PRERELEASE_SUFFIX 'alpha.01'"* ]]
+    [ -z "$(git tag -l)" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
+}
 
 @test "script: #prerelease:alpha hashtag creates named pre-release tag" {
     git tag -a "v1.5.0" -m "Version 1.5.0"
@@ -486,6 +665,34 @@ EOF
     git tag -l | grep -qx "v2.1.0"
     git tag -l | grep -qx "v2.1"
     grep -q "new_version=v2.1.0" "$GITHUB_OUTPUT_FILE"
+}
+
+@test "script: rejected floating tag update leaves all remote tags unchanged" {
+    git tag -a "v1.2.3" -m "Version 1.2.3"
+    git push origin "v1.2.3" --quiet
+    git tag -a "v1" -m "Major pointer"
+    git push origin "v1" --quiet
+    local previous_major
+    previous_major=$(git --git-dir="$ORIGIN_DIR" rev-parse refs/tags/v1)
+
+    echo "Bug fix" >> README.md
+    git add README.md
+    git commit --quiet -m "Fix atomic publication"
+
+    cat > "$ORIGIN_DIR/hooks/update" << 'EOF'
+#!/bin/bash
+[[ "$1" != "refs/tags/v1" ]]
+EOF
+    chmod +x "$ORIGIN_DIR/hooks/update"
+
+    run env GITHUB_OUTPUT="$GITHUB_OUTPUT_FILE" MOVE_MAJOR_TAG="true" \
+        "$BATS_TEST_DIRNAME/run-bump-version.sh"
+    [ "$status" -ne 0 ]
+    ! git ls-remote --exit-code --tags origin "refs/tags/v1.2.4" >/dev/null 2>&1
+    [ "$(git --git-dir="$ORIGIN_DIR" rev-parse refs/tags/v1)" = "$previous_major" ]
+    [ -z "$(git tag -l 'v1.2.4')" ]
+    [ "$(git rev-parse refs/tags/v1)" = "$previous_major" ]
+    [ ! -s "$GITHUB_OUTPUT_FILE" ]
 }
 
 @test "script: custom BRANCH_PREFIX_MAP overrides default prefix mapping" {

@@ -7,11 +7,54 @@ set -e
 # Tag prefix (e.g. 'v' → v1.2.3, '' → 1.2.3, 'release-' → release-1.2.3)
 TAG_PREFIX="${TAG_PREFIX-v}"
 
+_config_error() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+_validate_bump_map() {
+  local _name="$1" _map="$2" _entry _key _level
+  while IFS= read -r _entry; do
+    [[ -n "${_entry//[[:space:]]/}" ]] || continue
+    if [[ "$_entry" != *=* ]]; then
+      _config_error "Invalid $_name entry '$_entry': expected key=level"
+    fi
+    _key=$(echo "${_entry%%=*}" | tr -d ' \t\r')
+    _level=$(echo "${_entry#*=}" | tr -d ' \t\r')
+    if [[ -z "$_key" ]]; then
+      _config_error "Invalid $_name entry '$_entry': key must not be empty"
+    fi
+    case "$_level" in
+      major|minor|patch|none) ;;
+      *) _config_error "Invalid $_name entry '$_entry': level must be major, minor, patch, or none" ;;
+    esac
+  done <<< "$_map"
+}
+
+_validate_prerelease_suffix() {
+  local _suffix="$1" _segment
+  local -a _segments
+  if [[ ! "$_suffix" =~ ^[0-9A-Za-z.-]+$ ]]; then
+    _config_error "Invalid PRERELEASE_SUFFIX '$_suffix': use only letters, numbers, hyphens, and dots"
+  fi
+  if [[ "$_suffix" == .* || "$_suffix" == *. || "$_suffix" == *..* ]]; then
+    _config_error "Invalid PRERELEASE_SUFFIX '$_suffix': identifier segments must not be empty"
+  fi
+  IFS='.' read -r -a _segments <<< "$_suffix"
+  for _segment in "${_segments[@]}"; do
+    if [[ "$_segment" =~ ^[0-9]+$ && ${#_segment} -gt 1 && "$_segment" == 0* ]]; then
+      _config_error "Invalid PRERELEASE_SUFFIX '$_suffix': numeric identifiers must not contain leading zeroes"
+    fi
+  done
+}
+
 # Parse compound default_bump values (e.g. minor-prerelease → base=minor, prerelease=true)
 _DEFAULT_BUMP_RAW="${DEFAULT_BUMP:-patch}"
 _DEFAULT_PRERELEASE=false
 _DEFAULT_BASE_BUMP="$_DEFAULT_BUMP_RAW"
 case "$_DEFAULT_BUMP_RAW" in
+  patch|minor|major|none)
+    ;;
   prerelease|patch-prerelease)
     _DEFAULT_PRERELEASE=true
     _DEFAULT_BASE_BUMP="patch"
@@ -24,7 +67,28 @@ case "$_DEFAULT_BUMP_RAW" in
     _DEFAULT_PRERELEASE=true
     _DEFAULT_BASE_BUMP="major"
     ;;
+  *)
+    _config_error "Invalid DEFAULT_BUMP '$_DEFAULT_BUMP_RAW'"
+    ;;
 esac
+
+MARKER_STYLE="${MARKER_STYLE:-hashtag}"
+case "$MARKER_STYLE" in
+  hashtag|conventional-commits) ;;
+  *) _config_error "Invalid MARKER_STYLE '$MARKER_STYLE'" ;;
+esac
+
+_validate_bump_map "CC_TYPE_MAP" "${CC_TYPE_MAP:-}"
+BRANCH_PREFIX_MAP="${BRANCH_PREFIX_MAP:-feat=minor
+feature=minor
+fix=patch
+hotfix=patch
+bugfix=patch
+breaking=major
+major=major
+minor=minor
+patch=patch}"
+_validate_bump_map "BRANCH_PREFIX_MAP" "$BRANCH_PREFIX_MAP"
 
 # Get the merge commit message early (needed for skip detection)
 MERGE_COMMIT_MSG=$(git log -1 --pretty=%B)
@@ -70,6 +134,7 @@ _find_release_marker() {
 
 CC_BREAKING_RE='^([a-zA-Z]+)(\([^)]*\))?!:'
 CC_TYPE_RE='^([a-zA-Z]+)(\([^)]*\))?:'
+PRERELEASE_SUFFIX_RE='[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*'
 
 _conventional_title_has_bump_marker() {
   local _title_type _map_key
@@ -233,50 +298,37 @@ if [[ "${MARKER_STYLE:-hashtag}" == "conventional-commits" ]]; then
   # Regex patterns stored in variables for bash 3.2 compatibility
   CC_FOOTER_RE='^BREAKING([[:space:]]|-)CHANGE:'
 
-  # Scan every line of the commit message
-  while IFS= read -r line; do
-    scope_raw=""
-    scope_inner=""
-    # Check for type with ! suffix (breaking change shorthand) — always major
-    if [[ "$line" =~ $CC_BREAKING_RE ]]; then
-      CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
-      BUMP_TYPE="major"
-      echo "Conventional commits: '${CC_TYPE}!' breaking change detected → major bump"
-      COMMIT_HAS_EXPLICIT_MARKER=true
-      # Also capture pre-release scope hint from breaking-change lines (e.g. feat(pre:alpha)!:)
-      if [[ -z "$CC_SCOPE_PRERELEASE" ]]; then
-        scope_raw="${BASH_REMATCH[2]}"
-        scope_inner=$(echo "${scope_raw#(}" | tr '[:upper:]' '[:lower:]')
-        scope_inner="${scope_inner%)}"
-        if [[ "$scope_inner" =~ ^pre:([a-zA-Z][a-zA-Z0-9]*)$ ]]; then
-          CC_SCOPE_PRERELEASE="${BASH_REMATCH[1]}"
-        fi
-      fi
-      break
+  scope_raw=""
+  scope_inner=""
+  # Conventional Commit types are headers, so inspect only the title line.
+  if [[ "$COMMIT_TITLE" =~ $CC_BREAKING_RE ]]; then
+    CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+    BUMP_TYPE="major"
+    echo "Conventional commits: '${CC_TYPE}!' breaking change detected → major bump"
+    COMMIT_HAS_EXPLICIT_MARKER=true
+    scope_raw="${BASH_REMATCH[2]}"
+  elif [[ "$COMMIT_TITLE" =~ $CC_TYPE_RE ]]; then
+    CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+    scope_raw="${BASH_REMATCH[2]}"
+  fi
+
+  if [[ -n "$scope_raw" ]]; then
+    scope_inner=$(echo "${scope_raw#(}" | tr '[:upper:]' '[:lower:]')
+    scope_inner="${scope_inner%)}"
+    if [[ "$scope_inner" =~ ^pre:($PRERELEASE_SUFFIX_RE)$ ]]; then
+      CC_SCOPE_PRERELEASE="${BASH_REMATCH[1]}"
     fi
-    # Check for BREAKING CHANGE footer — always major
+  fi
+
+  # Body lines may still declare a breaking change using the documented footer.
+  while IFS= read -r line; do
     if [[ "$line" =~ $CC_FOOTER_RE ]]; then
       BUMP_TYPE="major"
       echo "Conventional commits: 'BREAKING CHANGE:' footer detected → major bump"
       COMMIT_HAS_EXPLICIT_MARKER=true
       break
     fi
-    # Capture first regular CC type prefix found (e.g. feat:, fix:, chore:)
-    if [[ -z "$CC_TYPE" && "$line" =~ $CC_TYPE_RE ]]; then
-      CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
-      # Check for pre-release scope hint: feat(pre:alpha): or fix(pre:rc):
-      # scope_raw/scope_inner are script-level temp vars (can't use 'local' outside a function).
-      if [[ -z "$CC_SCOPE_PRERELEASE" ]]; then
-        scope_raw="${BASH_REMATCH[2]}"
-        # Lowercase scope_inner so feat(Pre:ALPHA): normalises to pre:alpha (consistent with hashtag/footer)
-        scope_inner=$(echo "${scope_raw#(}" | tr '[:upper:]' '[:lower:]')
-        scope_inner="${scope_inner%)}"
-        if [[ "$scope_inner" =~ ^pre:([a-zA-Z][a-zA-Z0-9]*)$ ]]; then
-          CC_SCOPE_PRERELEASE="${BASH_REMATCH[1]}"
-        fi
-      fi
-    fi
-  done <<< "$MERGE_COMMIT_MSG"
+  done <<< "$COMMIT_BODY"
 
   # Look up CC_TYPE in CC_TYPE_MAP when no breaking change was found
   if [[ -z "$BUMP_TYPE" && -n "$CC_TYPE" && -n "$CC_TYPE_MAP" ]]; then
@@ -352,7 +404,7 @@ COMMIT_MSG_PRERELEASE=""
 COUNTER_ONLY_FROM_MSG=false
 
 # Step A (lowest priority baseline): hashtag marker — matched on lowercase message
-PRERELEASE_HASHTAG_RE='#(prerelease|pre):([a-zA-Z][a-zA-Z0-9]*)'
+PRERELEASE_HASHTAG_RE="#(prerelease|pre):($PRERELEASE_SUFFIX_RE)([[:space:]]|$)"
 PRERELEASE_BARE_RE='#(prerelease|pre)([^:a-zA-Z0-9]|$)'
 if [[ "$LOWER_MSG" =~ $PRERELEASE_HASHTAG_RE ]]; then
   COMMIT_MSG_PRERELEASE="${BASH_REMATCH[2]}"
@@ -367,9 +419,7 @@ if [[ -n "$CC_SCOPE_PRERELEASE" ]]; then
 fi
 
 # Step C (highest priority; overrides A and B): Pre-release: footer, case-insensitive
-# Intentional: only the first alphanumeric word after the colon is captured;
-# any trailing content (e.g. "Pre-release: rc.2") is silently ignored and "rc" is used.
-PRERELEASE_FOOTER_RE='^pre-?release:[[:space:]]*([a-zA-Z][a-zA-Z0-9]*)'
+PRERELEASE_FOOTER_RE="^pre-?release:[[:space:]]*($PRERELEASE_SUFFIX_RE)[[:space:]]*$"
 while IFS= read -r footer_line; do
   footer_line_lower=$(echo "$footer_line" | tr '[:upper:]' '[:lower:]')
   if [[ "$footer_line_lower" =~ $PRERELEASE_FOOTER_RE ]]; then
@@ -448,21 +498,16 @@ elif [[ "$_DEFAULT_PRERELEASE" == true && "$COMMIT_HAS_EXPLICIT_MARKER" == "fals
   echo "default_bump=$_DEFAULT_BUMP_RAW with no suffix → counter-only pre-release (v<base>-N)"
 fi
 
+if $PRERELEASE_MODE && ! $COUNTER_ONLY; then
+  _validate_prerelease_suffix "$PRERELEASE_SUFFIX"
+fi
+
 # --- Branch-name fallback bump detection ---
 # Used only when the commit message had no explicit marker.
 # The prefix before the first '/' is looked up in BRANCH_PREFIX_MAP.
 if [[ "$COMMIT_HAS_EXPLICIT_MARKER" == "false" && -n "$BRANCH_NAME" ]]; then
   branch_prefix="${BRANCH_NAME%%/*}"
   branch_prefix_lower=$(echo "$branch_prefix" | tr '[:upper:]' '[:lower:]')
-  BRANCH_PREFIX_MAP="${BRANCH_PREFIX_MAP:-feat=minor
-feature=minor
-fix=patch
-hotfix=patch
-bugfix=patch
-breaking=major
-major=major
-minor=minor
-patch=patch}"
   while IFS='=' read -r bp_key bp_val; do
     bp_key=$(echo "$bp_key" | tr -d ' \t\r' | tr '[:upper:]' '[:lower:]')
     bp_val=$(echo "$bp_val" | tr -d ' \t\r' | tr '[:upper:]' '[:lower:]')
@@ -620,12 +665,42 @@ git config user.name "GitHub Actions"
 git config user.email "actions@github.com"
 git tag -a "$NEW_TAG" -m "Bump version to $NEW_TAG"
 
+_PUSH_REFS=("$NEW_TAG")
+_FLOATING_TAGS=()
+
+# Prepare floating refs locally, then publish every requested ref in one atomic push.
+if [[ "$MOVE_MAJOR_TAG" == "true" ]]; then
+  if $PRERELEASE_MODE; then
+    echo "Skipping major tag update: floating pointer tags are not moved for pre-release versions."
+  else
+    IFS='.' read -ra NEW_VERSION_PARTS <<< "$NEW_VERSION"
+    MAJOR_TAG="${TAG_PREFIX}${NEW_VERSION_PARTS[0]}"
+    git tag -d "$MAJOR_TAG" 2>/dev/null || true
+    git tag -a "$MAJOR_TAG" -m "Move major tag to $NEW_TAG"
+    _PUSH_REFS+=("+refs/tags/$MAJOR_TAG:refs/tags/$MAJOR_TAG")
+    _FLOATING_TAGS+=("$MAJOR_TAG")
+  fi
+fi
+
+if [[ "$MOVE_MINOR_TAG" == "true" ]]; then
+  if $PRERELEASE_MODE; then
+    echo "Skipping minor tag update: floating pointer tags are not moved for pre-release versions."
+  else
+    IFS='.' read -ra NEW_VERSION_PARTS <<< "$NEW_VERSION"
+    MINOR_TAG="${TAG_PREFIX}${NEW_VERSION_PARTS[0]}.${NEW_VERSION_PARTS[1]}"
+    git tag -d "$MINOR_TAG" 2>/dev/null || true
+    git tag -a "$MINOR_TAG" -m "Move minor tag to $NEW_TAG"
+    _PUSH_REFS+=("+refs/tags/$MINOR_TAG:refs/tags/$MINOR_TAG")
+    _FLOATING_TAGS+=("$MINOR_TAG")
+  fi
+fi
+
 # Two overlapping runs can calculate the same immutable tag. Retry only when
 # the exact candidate is confirmed on the remote; authentication, permission,
 # transport, ruleset, and all other push failures retain their original status.
 _MAX_TAG_PUSH_ATTEMPTS=3
 _TAG_PUSH_ATTEMPT="${_TAG_PUSH_ATTEMPT:-1}"
-if _PUSH_OUTPUT=$(git push origin "$NEW_TAG" 2>&1); then
+if _PUSH_OUTPUT=$(git push --atomic origin "${_PUSH_REFS[@]}" 2>&1); then
   [[ -n "$_PUSH_OUTPUT" ]] && printf '%s\n' "$_PUSH_OUTPUT"
 else
   _PUSH_STATUS=$?
@@ -638,13 +713,18 @@ else
       ;;
   esac
 
+  # Restore the local view after any rejected transaction.
+  for _LOCAL_TAG in "$NEW_TAG" "${_FLOATING_TAGS[@]}"; do
+    git tag -d "$_LOCAL_TAG" >/dev/null 2>&1 || true
+  done
+  git fetch origin --tags --force >/dev/null 2>&1 || true
+
   if [[ "$_IS_TAG_CONFLICT" != "true" ]] || \
      ! git ls-remote --exit-code --tags origin "refs/tags/$NEW_TAG" >/dev/null 2>&1; then
     echo "Tag push failed for a non-conflict reason; not retrying." >&2
     exit "$_PUSH_STATUS"
   fi
 
-  git tag -d "$NEW_TAG" >/dev/null 2>&1 || true
   if [[ "$_TAG_PUSH_ATTEMPT" -ge "$_MAX_TAG_PUSH_ATTEMPTS" ]]; then
     echo "Tag conflict for $NEW_TAG persisted after $_MAX_TAG_PUSH_ATTEMPTS attempts." >&2
     exit "$_PUSH_STATUS"
@@ -656,40 +736,8 @@ else
     exec bash "${BASH_SOURCE[0]}"
 fi
 
-# Move major tag if requested — skipped for pre-release tags to protect consumers
-# who pin to e.g. @v1 and expect only stable releases.
-if [[ "$MOVE_MAJOR_TAG" == "true" ]]; then
-  if $PRERELEASE_MODE; then
-    echo "Skipping major tag update: floating pointer tags are not moved for pre-release versions."
-  else
-    IFS='.' read -ra NEW_VERSION_PARTS <<< "$NEW_VERSION"
-    MAJOR_TAG="${TAG_PREFIX}${NEW_VERSION_PARTS[0]}"
-
-    git tag -d "$MAJOR_TAG" 2>/dev/null || true
-    git push origin --delete "$MAJOR_TAG" 2>/dev/null || true
-    git tag -a "$MAJOR_TAG" -m "Move major tag to $NEW_TAG"
-    git push origin "$MAJOR_TAG"
-
-    echo "Major tag updated: $MAJOR_TAG -> $NEW_TAG"
-  fi
-fi
-
-# Move minor tag if requested — skipped for pre-release tags for the same reason.
-if [[ "$MOVE_MINOR_TAG" == "true" ]]; then
-  if $PRERELEASE_MODE; then
-    echo "Skipping minor tag update: floating pointer tags are not moved for pre-release versions."
-  else
-    IFS='.' read -ra NEW_VERSION_PARTS <<< "$NEW_VERSION"
-    MINOR_TAG="${TAG_PREFIX}${NEW_VERSION_PARTS[0]}.${NEW_VERSION_PARTS[1]}"
-
-    git tag -d "$MINOR_TAG" 2>/dev/null || true
-    git push origin --delete "$MINOR_TAG" 2>/dev/null || true
-    git tag -a "$MINOR_TAG" -m "Move minor tag to $NEW_TAG"
-    git push origin "$MINOR_TAG"
-
-    echo "Minor tag updated: $MINOR_TAG -> $NEW_TAG"
-  fi
-fi
+[[ -n "${MAJOR_TAG:-}" ]] && echo "Major tag updated: $MAJOR_TAG -> $NEW_TAG"
+[[ -n "${MINOR_TAG:-}" ]] && echo "Minor tag updated: $MINOR_TAG -> $NEW_TAG"
 
 echo "New version tag created: $NEW_TAG"
 

@@ -25,10 +25,13 @@ calculate_new_version() {
     if ! [[ "$MINOR" =~ ^[0-9]+$ ]]; then MINOR=0; fi
     if ! [[ "$PATCH" =~ ^[0-9]+$ ]]; then PATCH=0; fi
 
-    local LOWER_MSG LOWER_TITLE LOWER_BODY TITLE_HAS_BUMP_MARKER TITLE_HAS_SKIP_MARKER
+    local COMMIT_TITLE COMMIT_BODY LOWER_MSG LOWER_TITLE LOWER_BODY
+    local TITLE_HAS_BUMP_MARKER TITLE_HAS_SKIP_MARKER
+    COMMIT_TITLE=$(echo "$merge_commit_msg" | head -1)
+    COMMIT_BODY=$(echo "$merge_commit_msg" | tail -n +2)
     LOWER_MSG=$(echo "$merge_commit_msg" | tr '[:upper:]' '[:lower:]')
-    LOWER_TITLE=$(echo "$merge_commit_msg" | head -1 | tr '[:upper:]' '[:lower:]')
-    LOWER_BODY=$(echo "$merge_commit_msg" | tail -n +2 | tr '[:upper:]' '[:lower:]')
+    LOWER_TITLE=$(echo "$COMMIT_TITLE" | tr '[:upper:]' '[:lower:]')
+    LOWER_BODY=$(echo "$COMMIT_BODY" | tr '[:upper:]' '[:lower:]')
 
     # Determine whether the title carries an explicit marker.
     TITLE_HAS_BUMP_MARKER=false
@@ -67,23 +70,18 @@ calculate_new_version() {
         local cc_breaking_re='^([a-zA-Z]+)(\([^)]*\))?!:'
         local cc_footer_re='^BREAKING([[:space:]]|-)CHANGE:'
         local cc_type_re='^([a-zA-Z]+)(\([^)]*\))?:'
+        if [[ "$COMMIT_TITLE" =~ $cc_breaking_re ]]; then
+            CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+            BUMP_TYPE="major"
+        elif [[ "$COMMIT_TITLE" =~ $cc_type_re ]]; then
+            CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+        fi
         while IFS= read -r line; do
-            # Check for type with ! suffix — always major
-            if [[ "$line" =~ $cc_breaking_re ]]; then
-                CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
-                BUMP_TYPE="major"
-                break
-            fi
-            # Check for BREAKING CHANGE footer — always major
             if [[ "$line" =~ $cc_footer_re ]]; then
                 BUMP_TYPE="major"
                 break
             fi
-            # Capture first regular CC type prefix
-            if [[ -z "$CC_TYPE" && "$line" =~ $cc_type_re ]]; then
-                CC_TYPE=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
-            fi
-        done <<< "$merge_commit_msg"
+        done <<< "$COMMIT_BODY"
 
         # Look up CC_TYPE in cc_type_map
         if [[ -z "$BUMP_TYPE" && -n "$CC_TYPE" && -n "$cc_type_map" ]]; then
@@ -305,9 +303,10 @@ resolve_commit_prerelease_suffix() {
 
     local COMMIT_MSG_PRERELEASE=""
     local CC_SCOPE_PRERELEASE=""
+    local PRERELEASE_SUFFIX_RE='[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*'
 
     # Step A (lowest priority baseline): hashtag marker
-    local PRERELEASE_HASHTAG_RE='#(prerelease|pre):([a-zA-Z][a-zA-Z0-9]*)'
+    local PRERELEASE_HASHTAG_RE="#(prerelease|pre):($PRERELEASE_SUFFIX_RE)([[:space:]]|$)"
     if [[ "$lower_msg" =~ $PRERELEASE_HASHTAG_RE ]]; then
         COMMIT_MSG_PRERELEASE="${BASH_REMATCH[2]}"
     fi
@@ -324,7 +323,7 @@ resolve_commit_prerelease_suffix() {
                 local scope_inner
                 scope_inner=$(echo "${scope_raw#(}" | tr '[:upper:]' '[:lower:]')
                 scope_inner="${scope_inner%)}"
-                if [[ "$scope_inner" =~ ^pre:([a-zA-Z][a-zA-Z0-9]*)$ ]]; then
+                if [[ "$scope_inner" =~ ^pre:($PRERELEASE_SUFFIX_RE)$ ]]; then
                     CC_SCOPE_PRERELEASE="${BASH_REMATCH[1]}"
                 fi
             fi
@@ -335,7 +334,7 @@ resolve_commit_prerelease_suffix() {
                 # Lowercase so feat(Pre:ALPHA): normalises to pre:alpha (consistent with hashtag/footer)
                 scope_inner=$(echo "${scope_raw#(}" | tr '[:upper:]' '[:lower:]')
                 scope_inner="${scope_inner%)}"
-                if [[ "$scope_inner" =~ ^pre:([a-zA-Z][a-zA-Z0-9]*)$ ]]; then
+                if [[ "$scope_inner" =~ ^pre:($PRERELEASE_SUFFIX_RE)$ ]]; then
                     CC_SCOPE_PRERELEASE="${BASH_REMATCH[1]}"
                 fi
             fi
@@ -346,8 +345,7 @@ resolve_commit_prerelease_suffix() {
     fi
 
     # Step C (highest priority; overrides A and B): Pre-release: footer, case-insensitive
-    # Intentional: only the first alphanumeric word after the colon is captured.
-    local PRERELEASE_FOOTER_RE='^pre-?release:[[:space:]]*([a-zA-Z][a-zA-Z0-9]*)'
+    local PRERELEASE_FOOTER_RE="^pre-?release:[[:space:]]*($PRERELEASE_SUFFIX_RE)[[:space:]]*$"
     local footer_line
     while IFS= read -r footer_line; do
         local footer_lower

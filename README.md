@@ -1,7 +1,7 @@
 # Custom Version Bumper
 
 [![Test Custom Version Bumper Action](https://github.com/so1omon563/custom-semver-bumper/actions/workflows/test.yml/badge.svg)](https://github.com/so1omon563/custom-semver-bumper/actions/workflows/test.yml)
-[![Coverage](https://img.shields.io/badge/coverage-79%25-yellow)](https://github.com/so1omon563/custom-semver-bumper/actions/workflows/test.yml)
+[![Coverage](https://img.shields.io/badge/coverage-83%25-brightgreen)](https://github.com/so1omon563/custom-semver-bumper/actions/workflows/test.yml)
 
 GitHub Action that **automatically tags every merge commit** with a
 [Semantic Versioning 2.0.0][semver-spec]-compliant Git tag. Every time a PR merges
@@ -431,7 +431,9 @@ latest patch automatically.
 ```
 
 For example, bumping from `v1.2.3` to `v1.3.0` will also move `v1` and `v1.3` to
-point to the same commit as `v1.3.0`.
+point to the same commit as `v1.3.0`. The versioned and requested floating tags
+are pushed atomically, so a rejected floating-tag update leaves every remote tag
+at its previous value.
 
 > **Immutability note:** Versioned tags (`v1.2.3`, `v1.3.0-alpha.1`) are **never**
 > moved or deleted — they are immutable records. Floating pointer tags (`v1`, `v1.3`)
@@ -456,6 +458,10 @@ to drive version bumps from commit type prefixes instead of hashtag markers.
 | `feat!: …` or `BREAKING CHANGE:` footer   | major                           |
 | Any scoped variant (e.g. `feat(auth): …`) | same rules apply                |
 | Type not in `cc_type_map`                 | falls through to `default_bump` |
+
+Type prefixes and the `!` shorthand are parsed only from the first-line commit
+header. Commit-body lines are scanned only for `BREAKING CHANGE:` and
+`BREAKING-CHANGE:` footers.
 
 ```yaml
 - uses: so1omon563/custom-semver-bumper@v1
@@ -503,7 +509,9 @@ hatches still work in this mode.
 > | `canary` | `v1.3.0-canary.7` | Canary deployment ring |
 
 Set `prerelease_suffix` to append a label identifier to the tag. The counter
-auto-increments for each run that targets the same base version:
+auto-increments for each run that targets the same base version. Values use
+dot-separated SemVer identifiers: letters, numbers, and hyphens only, with no
+empty segments or leading zeroes in numeric segments:
 
 ```yaml
 - uses: so1omon563/custom-semver-bumper@v1
@@ -870,7 +878,7 @@ permissions:
 
 1. Run the test suite: `cd tests/ && ./run_tests.sh`
 2. Ensure scripts are executable: `chmod +x tests/*.sh`
-3. Install optional test deps: `make install-deps` (macOS with Homebrew)
+3. Install full-suite test dependencies: `make install-deps` (macOS with Homebrew)
 
 For detailed local workflow notes, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -878,7 +886,7 @@ For detailed local workflow notes, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | Suite       | Command                 | What it covers                               |
 | ----------- | ----------------------- | -------------------------------------------- |
-| All         | `make test-all`         | Runs all suites                              |
+| All         | `make test-all`         | Runs all suites (requires `bats-core`)       |
 | Unit        | `make test-unit`        | Core version bumping logic                   |
 | Integration | `make test-integration` | Full Git repository simulation               |
 | BATS        | `make test-bats`        | Structured assertions (requires `bats-core`) |
